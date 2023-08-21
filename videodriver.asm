@@ -1,0 +1,385 @@
+
+; NORTH STAR ADVANTAGE
+; ##############################################
+; Boot ROM video driver (terminal emulator)
+;
+; Disassembled by ian Butler, Aug 2023, no revisions
+
+; include "ports.asm"
+; org 0x8414 in 4K 'REV-BK' ROM (998 bytes)
+
+; Public facing things are:
+;   video_driver	Main routine
+;   video_drawcursor	Cursor draw routine
+
+;   video_font		Beginning of built-in glyph table
+
+; Some nice equalities defining the video driver data block are in
+; ports.asm, which also includes public bit numbers for the status byte.
+
+; The video driver provides basic text terminal functionality, and stays out
+; of the stack and RAM, other than a data block used to store a few status
+; details and pointers, and ten bytes for the cursor.  The main entry point
+; is here, with a character passed along in A, and the video driver block
+; address in IX.
+
+; The addresses in the comments are based on the 4K 'REV-BK' ROM.
+
+video_driver:
+	and 0x7f		;8414 Ignore bit 8
+	cp 0x7f			;8416 Then bail immediately if it's null
+	jp z,.bounce		;8418
+	cp 0x20			;841b Draw a printable symbol
+	jp nc,.drawsym		;841d
+	ld c,a			;8420 Or process a control code
+	jr .cursor_ctl		;8421 Jumping here causes a cursor redraw
+				;     first, which erases the current one
+				;     before a new one might be drawn.
+
+; Process just a control code in A.
+.ctlonly:
+	ld a,c			;8423 Control code goes in C
+	ld h,(ix+vdb_status)	;8424 H is current status flags
+	ld l,(ix+vdb_scan)	;8427 L is current top of screen
+	cp 0x0d			;842a ^M Carriage return
+	jr z,.cr		;842c
+	cp 0x0a			;842e ^J Down arrow/line feed
+	jr z,.lf		;8430
+	cp 0x0c			;8432 ^L Right arrow
+	jr z,.right		;8434
+	cp 0x1f			;8436 ^_ newline
+	jr z,.newline	;8438
+	cp 0x0e			;843a ^N Clear to end of line
+	jp z,.cleol		;843c
+	cp 0x0f			;843f ^O Clear to end of screen
+	jp z,.cleos		;8441 
+	cp 0x18			;8444 ^X Cursor on
+	jr z,.cursoron		;8446
+	cp 0x19			;8448 ^Y Cursor off
+	jr z,.cursoroff		;844a
+	cp 0x08			;844c ^H Left arrow/backspace
+	jr z,.bs		;844e 
+	cp 0x0b			;8450 ^K Up arrow/reverse line feed
+	jr z,.rlf		;8452
+	cp 0x1e			;8454 ^^ Home cursor
+	jr nz,.cursor		;8456  All other cases, bounce
+
+; Home cursor
+	ld (ix+vdb_y),l		;8458 Set Y to current top of screen
+.cr:
+	xor a			;845b Set X to column 0
+.move_x:
+	inc c			;845c Make sure zero flag is clear
+	jr .store_x		;845d Store X and update cursor
+
+; Set cursor on or off (and home it)
+.cursoron:
+	res vdb_curs_isoff,h	;845f Reset inhibit flag
+	jr .curs_newstat	;8461 Save status and update cursor
+.cursoroff:
+	set vdb_curs_isoff,h	;8463 Set inhibit flag
+	jr .curs_newstat	;8465 Save status and update cursor
+
+; Cursor right.
+.right:
+	ld a,d			;8467 Increment D
+	inc a			;8468 Try moving cursor
+	cp 0x50			;8469 Did we fall off the right side?
+	jr nz,.store_x		;846b  No, so store it as is
+	bit vdb_nowrap,h	;846d  Yes, check if we can wrap
+	jr nz,.cursor		;846f   No, inhibit newline
+
+; New line (cursor right falls into here in case of a line wrap).
+.newline:
+	xor a			;8471 Reset cursor X to 0
+
+; Write back a new cursor position.
+.store_x:
+	ld (ix+vdb_x),a		;8472 Store it back to data block
+	jr nz,.cursor		;8475 And draw new cursor if NZ
+				;     otherwise, imply a line feed
+
+; Line feed.
+.lf:
+	ld (ix+vdb_y),e		;8477 Grab our current cursor Y
+	set vdb_hit_end,h	;847a Preemptively set hit_end
+	ld a,l			;847c
+	add a,0x0a		;847d Add ten
+	ld c,a			;847f
+	add a,0xe6		;8480 Does that take us past visible lines?
+	sub e			;8482
+	jr nz,.cursor		;8483 No, don't bother updating status
+	jr .scroll		;8485 Yes, time to scroll
+
+
+; Cursor draw/erase routine.  There are three ways to get in here:
+;   .curs_newstat writes back vdb_status out of H, then draws cursor
+;   cursor just draws the cursor
+;   cursor_ctl draws (really erases) the cursor and then calls .ctlonly
+
+.curs_newstat:
+	ld (ix+vdb_status),h	;8487 Save status byte from H
+
+video_drawcursor:		;xxxx Public-facing alias for .cursor
+.cursor:
+	set 7,c			;848a Entering here inhibits .ctlonly call
+.cursor_ctl:
+	ld d,(ix+vdb_x)		;848c Load cursor position
+	ld e,(ix+vdb_y)		;848f
+	ld b,0x0a		;8492 Ten scan lines
+	bit vdb_curs_isoff,(ix+vdb_status);8494 Cursor inhibited?
+	jr z,.cursor_on		;8498 No, redraw cursor
+	ld a,e			;849a Skip cursor draw if it's off
+	add a,b			;849b But still leave DE where it would have
+	ld e,a			;849c ended up after a redraw loop.
+	jr .cursor_off		;849d 
+.cursor_on:
+	ld h,(ix+vdb_cursptr+1)	;849f Load cursor mask
+	ld l,(ix+vdb_cursptr)	;84a2
+.cursor_loop:
+	ld a,(de)		;84a5 And loop to XOR character cell with it 
+	xor (hl)		;84a6
+	ld (de),a		;84a7
+	inc hl			;84a8
+	inc e			;84a9
+	djnz .cursor_loop	;84aa
+.cursor_off:
+	bit 7,c			;84ac Check if a control code is pending
+	jp z,.ctlonly		;84ae Yes, do it, otherwise fall into .bounce
+
+; Load return address from video driver block and skedaddle.
+.bounce:
+	ld l,(ix+vdb_ret)	;84b1 We are
+	ld h,(ix+vdb_ret+1)	;84b4 outta
+	jp (hl)			;84b7 here
+
+; Backspace
+.bs:
+	ld a,d			;84b8 Try decrementing cursor X
+	dec a			;84b9
+	jp p,.move_x		;84ba Just update cursor if we didn't wrap
+	bit vdb_nowrap,h	;84bd We did wrap!  Is wrap inhibited?
+	jr nz,.cursor		;84bf  Yes, we're out
+	ld (ix+vdb_x),0x4f	;84c1  No, wrap to last column and RLF
+
+; Reverse line feed
+.rlf:
+	ld a,e			;84c5
+	sub 0x14		;84c6 Go up 20 lines (DE is in next cell down) 
+	ld (ix+vdb_y),a		;84c8 Store new Y cursor
+	ld e,a			;84cb
+	ld a,l			;84cc Back up ten more lines for vdb_scan
+	sub 0x0a		;84cd 
+	cp e			;84cf Did we scroll up past the top?
+	jr nz,.cursor		;84d0 No, just draw cursor
+	set vdb_hit_top,h	;84d2 Preemptively set hit_top
+	ld c,e			;84d4 
+
+; Scroll, and erase the line we're about to inhabit.
+.scroll:
+	ld d,0x50		;84d5 Eighty columns
+	ld l,e			;84d7
+.scroll_clrrow:
+	ld b,0x0a		;84d8 Ten lines
+	dec d			;84da
+	xor a			;84db They must all be erased
+.scroll_clrcell:
+	ld (de),a		;84dc
+	inc e			;84dd
+	djnz .scroll_clrcell	;84de Each cell...
+	ld e,l			;84e0
+	or d			;84e1
+	jr nz,.scroll_clrrow	;84e2 ...each row
+	ld (ix+vdb_scan),c	;84e4 Update software start row
+	bit vdb_noscroll,h	;84e7 Scroll inhibited?
+	jr nz,.curs_newstat	;84e9 Yes, update status
+	ld a,c			;84eb No, update hardware start line
+	out (video_start),a	;84ec
+	jr .cursor		;84ee And draw cursor
+
+; Draw a printable symbol from A over the cursor, and advance to next cell.
+.drawsym:
+	sub 0x20		;84f0 Only printable characters in glyphs
+	ld c,a			;84f2 Load our character number into C
+	xor a			;84f3
+	ld b,a			;84f4 Clear B
+	ld h,(ix+vdb_pixmaps+1)	;84f5 Fetch the pointer to our bitmap table
+	ld l,(ix+vdb_pixmaps)	;84f8
+	add hl,bc		;84fb Multiply char number by 7 for offset
+	add hl,bc		;84fc
+	add hl,bc		;84fd
+	add hl,bc		;84fe
+	add hl,bc		;84ff
+	add hl,bc		;8500
+	add hl,bc		;8501
+	ld d,(ix+vdb_x)		;8502 Cursor position is our start address
+	ld e,(ix+vdb_y)		;8505
+	ld a,(ix+vdb_inverse)	;8508
+	ld (de),a		;850b Top line is always blank or inverse
+	inc e			;850c
+	ld bc,0x0702		;850d Seven glyph lines and two blanks
+	bit 7,(hl)		;8510 Bit 7 on top line indicates 1x descender
+	jr z,.ds_justglyph	;8512
+	ld (de),a		;8514 Write first blank line
+	inc e			;8515
+	dec c			;8516
+	bit 6,(hl)		;8517 Bit 6 on top line indicates 2x descender
+	jr z,.ds_justglyph	;8519
+	ld (de),a		;851b Write second blank line
+	inc e			;851c
+	dec c			;851d
+.ds_justglyph:
+	ld a,(hl)		;851e Load bitmap
+	and 0x3f		;851f Wipe off the left two pixels
+	xor (ix+vdb_inverse)	;8521 Invert as appropriate
+	ld (de),a		;8524 Store line to video memory
+	inc hl			;8525
+	inc e			;8526
+	djnz .ds_justglyph	;8527 Loop til glyph is drawn
+	ld a,(ix+vdb_inverse)	;8529 Then load blank line template
+.ds_fillcell:
+	dec c			;852c And fill the remainder of the cell
+	jp m,.ds_advance	;852d When it's done, advance cursor
+	ld (de),a		;8530
+	inc e			;8531
+	jr .ds_fillcell		;8532 Loop until full
+.ds_advance:
+	ld c,0x0c		;8534 Cheekily pass a control-L
+	jp .ctlonly		;8536 to the control code routine
+
+; Clear to the end of the screen.
+.cleos:
+	ld a,l			;8539 L is top scan line
+	sub e			;853a 
+	sub 0x10		;853b E was cursor+10
+	jr z,.cleol		;853d If we're in last row, just cleol.
+	ld c,a			;853f
+	ld h,0x4f		;8540 All 80 columns
+.cleos_col:
+	ld b,c			;8542
+	xor a			;8543
+	ld l,e			;8544
+.cleos_row:
+	ld (hl),a		;8545 Erase all relevant rows
+	inc l			;8546
+	djnz .cleos_row		;8547
+	dec h			;8549
+	jp p,.cleos_col		;854a Loop until H underflows
+				;     then clear to end of line.
+
+; Clear from cursor (in DE) to end of the line.
+.cleol:
+	ex de,hl		;854d
+	dec l			;854e
+	ld e,l			;854f
+.cleol_col:
+	ld b,0x0a		;8550 Ten lines
+	xor a			;8552
+	ld l,e			;8553
+.cleol_row:
+	ld (hl),a		;8554 Erase one cell in this loop
+	dec l			;8555
+	djnz .cleol_row		;8556
+	inc h			;8558
+	ld a,h			;8559
+	cp 0x50			;855a Are we out of columns?
+	jr nz,.cleol_col	;855c Keep erasing til the end of line
+	jp .cursor		;855e And draw cursor
+
+; BLOCK 'video_font' (start 0x8561 end 0x87fa)
+video_font:
+	defb 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ; 
+	defb 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x08 ; !
+	defb 0x14, 0x14, 0x14, 0x00, 0x00, 0x00, 0x00 ; "
+	defb 0x14, 0x14, 0x3e, 0x14, 0x3e, 0x14, 0x14 ; #
+	defb 0x08, 0x1e, 0x28, 0x1c, 0x0a, 0x3c, 0x08 ; $
+	defb 0x32, 0x32, 0x04, 0x08, 0x10, 0x26, 0x26 ; %
+	defb 0x10, 0x28, 0x28, 0x10, 0x2a, 0x24, 0x1a ; &
+	defb 0x08, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00 ; '
+	defb 0x04, 0x08, 0x10, 0x10, 0x10, 0x08, 0x04 ; (
+	defb 0x10, 0x08, 0x04, 0x04, 0x04, 0x08, 0x10 ; )
+	defb 0x08, 0x2a, 0x1c, 0x08, 0x1c, 0x2a, 0x08 ; *
+	defb 0x00, 0x08, 0x08, 0x3e, 0x08, 0x08, 0x00 ; +
+	defb 0x80, 0x00, 0x00, 0x00, 0x08, 0x08, 0x10 ; ,
+	defb 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00 ; -
+	defb 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08 ; .
+	defb 0x02, 0x02, 0x04, 0x08, 0x10, 0x20, 0x20 ; /
+	defb 0x1c, 0x22, 0x26, 0x2a, 0x32, 0x22, 0x1c ; 0
+	defb 0x08, 0x18, 0x08, 0x08, 0x08, 0x08, 0x1c ; 1
+	defb 0x1c, 0x22, 0x02, 0x0c, 0x10, 0x20, 0x3e ; 2
+	defb 0x3e, 0x02, 0x04, 0x0c, 0x02, 0x22, 0x1c ; 3
+	defb 0x04, 0x0c, 0x14, 0x24, 0x3e, 0x04, 0x04 ; 4
+	defb 0x3e, 0x20, 0x3c, 0x02, 0x02, 0x22, 0x1c ; 5
+	defb 0x0c, 0x10, 0x20, 0x3c, 0x22, 0x22, 0x1c ; 6
+	defb 0x3e, 0x02, 0x04, 0x08, 0x10, 0x20, 0x20 ; 7
+	defb 0x1c, 0x22, 0x22, 0x1c, 0x22, 0x22, 0x1c ; 8
+	defb 0x1c, 0x22, 0x22, 0x1e, 0x02, 0x04, 0x18 ; 9
+	defb 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00 ; :
+	defb 0x80, 0x08, 0x00, 0x00, 0x08, 0x08, 0x10 ; ;
+	defb 0x04, 0x08, 0x10, 0x20, 0x10, 0x08, 0x04 ; <
+	defb 0x00, 0x00, 0x3e, 0x00, 0x3e, 0x00, 0x00 ; =
+	defb 0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10 ; >
+	defb 0x1c, 0x22, 0x04, 0x08, 0x08, 0x00, 0x08 ; ?
+	defb 0x1c, 0x22, 0x2e, 0x2a, 0x2e, 0x20, 0x1e ; @
+	defb 0x1c, 0x22, 0x22, 0x22, 0x3e, 0x22, 0x22 ; A
+	defb 0x3c, 0x22, 0x22, 0x3c, 0x22, 0x22, 0x3c ; B
+	defb 0x1c, 0x22, 0x20, 0x20, 0x20, 0x22, 0x1c ; C
+	defb 0x3c, 0x22, 0x22, 0x22, 0x22, 0x22, 0x3c ; D
+	defb 0x3e, 0x20, 0x20, 0x3c, 0x20, 0x20, 0x3e ; E
+	defb 0x3e, 0x20, 0x20, 0x3c, 0x20, 0x20, 0x20 ; F
+	defb 0x1c, 0x22, 0x20, 0x20, 0x2e, 0x22, 0x1e ; G
+	defb 0x22, 0x22, 0x22, 0x3e, 0x22, 0x22, 0x22 ; H
+	defb 0x1c, 0x08, 0x08, 0x08, 0x08, 0x08, 0x1c ; I
+	defb 0x0e, 0x04, 0x04, 0x04, 0x04, 0x24, 0x18 ; J
+	defb 0x22, 0x24, 0x28, 0x30, 0x28, 0x24, 0x22 ; K
+	defb 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x3e ; L
+	defb 0x22, 0x36, 0x2a, 0x2a, 0x22, 0x22, 0x22 ; M
+	defb 0x22, 0x32, 0x32, 0x2a, 0x26, 0x26, 0x22 ; N
+	defb 0x1c, 0x22, 0x22, 0x22, 0x22, 0x22, 0x1c ; O
+	defb 0x3c, 0x22, 0x22, 0x3c, 0x20, 0x20, 0x20 ; P
+	defb 0x1c, 0x22, 0x22, 0x22, 0x2a, 0x24, 0x1a ; Q
+	defb 0x3c, 0x22, 0x22, 0x3c, 0x28, 0x24, 0x22 ; R
+	defb 0x1c, 0x22, 0x20, 0x1c, 0x02, 0x22, 0x1c ; S
+	defb 0x3e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08 ; T
+	defb 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x1c ; U
+	defb 0x22, 0x22, 0x22, 0x22, 0x14, 0x14, 0x08 ; V
+	defb 0x22, 0x22, 0x22, 0x2a, 0x2a, 0x2a, 0x14 ; W
+	defb 0x22, 0x22, 0x14, 0x08, 0x14, 0x22, 0x22 ; X
+	defb 0x22, 0x22, 0x14, 0x08, 0x08, 0x08, 0x08 ; Y
+	defb 0x3e, 0x02, 0x04, 0x08, 0x10, 0x20, 0x3e ; Z
+	defb 0x1c, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1c ; [
+	defb 0x20, 0x20, 0x10, 0x08, 0x04, 0x02, 0x02 ; \
+	defb 0x1c, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1c ; ]
+	defb 0x08, 0x14, 0x22, 0x00, 0x00, 0x00, 0x00 ; ^
+	defb 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e ; _
+	defb 0x10, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00 ; `
+	defb 0x00, 0x00, 0x38, 0x04, 0x3c, 0x24, 0x1e ; a
+	defb 0x20, 0x20, 0x3c, 0x22, 0x22, 0x22, 0x3c ; b
+	defb 0x00, 0x00, 0x1e, 0x20, 0x20, 0x20, 0x1e ; c
+	defb 0x02, 0x02, 0x1e, 0x22, 0x22, 0x22, 0x1e ; d
+	defb 0x00, 0x00, 0x1c, 0x22, 0x3e, 0x20, 0x1c ; e
+	defb 0x0c, 0x12, 0x10, 0x3c, 0x10, 0x10, 0x10 ; f
+	defb 0xdc, 0x22, 0x22, 0x22, 0x1e, 0x02, 0x1c ; g
+	defb 0x20, 0x20, 0x2c, 0x32, 0x22, 0x22, 0x22 ; h
+	defb 0x00, 0x08, 0x00, 0x08, 0x08, 0x08, 0x1c ; i
+	defb 0x84, 0x00, 0x04, 0x04, 0x04, 0x14, 0x08 ; j
+	defb 0x20, 0x20, 0x24, 0x28, 0x30, 0x28, 0x24 ; k
+	defb 0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x1c ; l
+	defb 0x00, 0x00, 0x34, 0x2a, 0x2a, 0x2a, 0x2a ; m
+	defb 0x00, 0x00, 0x2c, 0x32, 0x22, 0x22, 0x22 ; n
+	defb 0x00, 0x00, 0x1c, 0x22, 0x22, 0x22, 0x1c ; o
+	defb 0xfc, 0x22, 0x22, 0x22, 0x3c, 0x20, 0x20 ; p
+	defb 0xdc, 0x24, 0x24, 0x24, 0x1c, 0x04, 0x06 ; q
+	defb 0x00, 0x00, 0x2c, 0x32, 0x20, 0x20, 0x20 ; r
+	defb 0x00, 0x00, 0x1e, 0x20, 0x1c, 0x02, 0x3c ; s
+	defb 0x08, 0x08, 0x1c, 0x08, 0x08, 0x08, 0x04 ; t
+	defb 0x00, 0x00, 0x22, 0x22, 0x22, 0x26, 0x1a ; u
+	defb 0x00, 0x00, 0x22, 0x22, 0x14, 0x14, 0x08 ; v
+	defb 0x00, 0x00, 0x22, 0x22, 0x2a, 0x2a, 0x14 ; w
+	defb 0x00, 0x00, 0x22, 0x14, 0x08, 0x14, 0x22 ; x
+	defb 0xe2, 0x22, 0x22, 0x26, 0x1a, 0x02, 0x1c ; y
+	defb 0x00, 0x00, 0x3e, 0x04, 0x08, 0x10, 0x3e ; z
+	defb 0x04, 0x08, 0x08, 0x10, 0x08, 0x08, 0x04 ; {
+	defb 0x08, 0x08, 0x08, 0x00, 0x08, 0x08, 0x08 ; |
+	defb 0x10, 0x08, 0x08, 0x04, 0x08, 0x08, 0x10 ; }
+	defb 0x02, 0x1c, 0x20, 0x00, 0x00, 0x00, 0x00 ; ~
